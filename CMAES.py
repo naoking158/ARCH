@@ -137,7 +137,6 @@ class CMAES:
                 
         idx : 1D-array (lam)
                 ascending orderd index based on the `arf`
-
         """
         
         arf = self.func(arx)
