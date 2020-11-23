@@ -1,11 +1,14 @@
+#!/usr/bin/env python3
+
 from scipy import optimize
 from scipy.stats import kendalltau  # tau-b in scipy v1.1.0
 from scipy.stats import norm
 import numpy as np
 import gc
 
-class ARCH:
-    
+
+class ARCHBase:
+
     @staticmethod
     def lin2nonlin(A, b):
         def gi(i):
@@ -27,162 +30,11 @@ class ARCH:
         b_box = np.block([b_box_lb, b_box_ub])
         return A_box, b_box
 
-    def __init__(self, dim, weight, fobjective, bound=None, 
-                 linear_ineq_quak=None, linear_eq_quak=None, 
-                 nonlinear_ineq_quak_list=None, nonlinear_eq_quak_list=None):
-        """
-        Parameters
-        ----------
-        dim : int
-        weight : 1d array-like
-        fobjective : callable (a solution object -> float)
-            f(x) 
-        bound : tuple (lb, ub)
-            lb[i] <= x[i] <= ub[i]
-        linear_ineq_quak : tuple (A, b)
-            A * x - b <= 0, A: 2D, b: 1D
-            If both linear_quak and nonlinear_quak_list are given, 
-            linear_quak is transformed to nonlinear_quak internally.
-        linear_eq_quak : tuple (A, b)
-            A * x - b = 0, A: 2D, b: 1D
-            If both linear_(ineq/eq)_quak and nonlinear_(ineq/eq)_quak_list are given, 
-            linear_(ineq/eq)_quak is transformed to nonlinear_(ineq/eq)_quak internally.
-        nonlinear_ineq_quak_list : list of tuple (gi, grad_gi)
-            gi(x) <= 0 : argument is an array
-            If gradient of gi is not available, set `None` to grad_gi.
-        nonlinear_eq_quak_list : list of tuple (gi, grad_gi)
-            gi(x) = 0 : argument is an array
-            If gradient of gi is not available, set `None` to grad_gi.
-        """
-        # Input Preprocessing
-        self.f = fobjective
-
-        # Linear Ineq. QUAK
-        if linear_ineq_quak is not None:
-            self.linear_ineq_quak = linear_ineq_quak
-        else:
-            self.linear_ineq_quak = (np.empty((0, dim)), np.empty(0))
-        if bound is not None:
-            A, b = self.box2lin(bound[0], bound[1])
-            self.linear_ineq_quak = (np.vstack((A, self.linear_ineq_quak[0])), np.hstack((b, self.linear_ineq_quak[1])))
-        
-        # Linear Eq. QUAK
-        if linear_eq_quak is not None:
-            self.linear_eq_quak = linear_eq_quak
-        else:
-            self.linear_eq_quak = (np.empty((0, dim)), np.empty(0))
-
-        # Nonlinear Ineq. QUAK
-        if nonlinear_ineq_quak_list is not None:
-            self.nonlinear_ineq_quak_list = nonlinear_ineq_quak_list
-        else:
-            self.nonlinear_ineq_quak_list = []
-        
-        # Nonlinear Eq. QUAK
-        if nonlinear_eq_quak_list is not None:
-            self.nonlinear_eq_quak_list = nonlinear_eq_quak_list
-        else:
-            self.nonlinear_eq_quak_list = []
-
-        # Linear to Nonlinear
-        if len(self.nonlinear_ineq_quak_list) + len(self.nonlinear_eq_quak_list) > 0:
-            if len(self.linear_ineq_quak[1]) + len(self.linear_eq_quak[1]) > 0:
-                self.nonlinear_ineq_quak_list += self.lin2nonlin(*self.linear_ineq_quak)
-                self.nonlinear_eq_quak_list += self.lin2nonlin(*self.linear_eq_quak)
-                self.linear_ineq_quak = (np.empty((0, dim)), np.empty(0))
-                self.linear_eq_quak = (np.empty((0, dim)), np.empty(0))
-
-        # Setup QUAK Constraint Handler
-        if len(self.linear_ineq_quak[1]) + len(self.linear_eq_quak[1]) > 0:
-            self.quak_handler = ARCHLinear(self.linear_ineq_quak[0], self.linear_ineq_quak[1], self.linear_eq_quak[0], self.linear_eq_quak[1], weight)
-        elif len(self.nonlinear_ineq_quak_list) + len(self.nonlinear_eq_quak_list) > 0:
-            self.quak_handler = ARCHNonLinear(dim, weight, self.nonlinear_ineq_quak_list, self.nonlinear_eq_quak_list)
-        else:
-            self.quak_handler = ARCHBase(dim, weight, 0, 0)
-
-
-    # TODO: only for debug
-    def setcma(self, cma):
-        self._cma = cma
-    def __call__(self, solution_list):
-        for sol in solution_list:
-            sol._x = sol.arxraw
-        xcov = self._cma.transform(self._cma.transform(np.eye(self._cma.N)))
-        self.prepare(self._cma.xmean, xcov)
-        arfit = self.do(solution_list)
-        for i, sol in enumerate(solution_list):
-            sol.arfit = arfit[i]
-            sol.arffeas = sol._f
-      
-    def do(self, solution_list):
-        """Do all the job"""
-        for sol in solution_list:
-            self.repair_quak(sol)
-            self.evaluate_f(sol)
-        return self.total_ranking(solution_list)
-
-    def prepare(self, xmean, xcov):
-        self.quak_handler.prepare(xmean, xcov)
-        
-    def repair_quak(self, solution):
-        """Evaluate QUAK constraint violations and repair
-        
-        Parameter
-        ---------
-        solution : object
-            solution._x (input) : original solution
-            solution._x_repaired (output) : repaired solution
-            solution._quak_violation (output) : list of constraint violations
-            solution._quak_penalty (output) : penalty for quak violation
-        """
-        if self.quak_handler:
-            solution._x_repaired = self.quak_handler.repair(solution._x)
-            solution._quak_violation = self.quak_handler.compute_violation(solution._x)
-            solution._quak_penalty = self.quak_handler.compute_penalty(solution._x, solution._x_repaired)
-        else:
-            solution._x_repaired = solution._x
-            solution._quak_violation = []
-            solution._quak_penalty = 0
-            
-    def evaluate_f(self, solution):
-        """Evaluate objective
-        
-        Parameter
-        ---------
-        solution : object
-            solution._x_repaired (input) : repaired solution
-            solution._f (output) : objective value
-        """
-        if np.all(self.quak_handler.compute_violation(solution._x_repaired) <= 0):
-            solution._f = self.f(solution)
-        else:
-            solution._f = np.inf
-
-    def total_ranking(self, solution_list):
-        """Compute the total ranking
-        
-        Parameter
-        ---------
-        solution_list : list of object
-            solution._f (input) : objective value
-            solution._quak_penalty (input) : penalty for quak violation
-
-        Return
-        ------
-        final ranking : list of ranking (float)
-        """
-        ff = [sol._f for sol in solution_list]
-        ua = [sol._quak_penalty for sol in solution_list]
-        rt = self.quak_handler.total_ranking(ff, ua)
-        return rt
-        
-
-class ARCHBase:
     """Adaptive Ranking Based Constraint Handling for Explicit Constraints
-    
-    It is a base (abstract) implementation of Quantifiable/Unrelaxable/Apriori/Known 
-    equality and inequality constraints. 
-    
+
+    It is a base (abstract) implementation of Quantifiable/Unrelaxable/Apriori/Known
+    equality and inequality constraints.
+
     Main Functionarity
     ------------------
     * compute_violation : compute violation values
@@ -190,26 +42,28 @@ class ARCHBase:
     * repair        : repair infeasible solutions
     * compute_penalty : compute the mahalanobis distance betwen original and repaired solutions
     * total_ranking : compute total ranking
-    
+
     Reference
     ---------
-    N. Sakamoto and Y. Akimoto: Adaptive Ranking Based Constraint Handling 
-    for Explicitly Constrained Black-Box Optimization, GECCO 2019. 
+    N. Sakamoto and Y. Akimoto: Adaptive Ranking Based Constraint Handling
+    for Explicitly Constrained Black-Box Optimization, GECCO 2019.
     https://doi.org/10.1145/3321707.3321717
-    
+
     """
-    def __init__(self, dim, weight, num_of_eqcons, num_of_ineqcons, 
+    def __init__(self, fobjective, dim, weight, num_of_eqcons, num_of_ineqcons,
                  eps_min=1e-15, eps_max=1e-4, tol_for_eqcons=1e-4, tol_for_ineqcons=0.0, maxiter=300):
         """
         Parameters
         ----------
+        fobjective : callable (a solution object -> float)
+            f(x)
         dim : int
             dimension of the search space
         weight : array-like
             recombination weights
         num_of_eqcons, num_of_ineqcons : int
             number of equality and inequality constraints
-        
+
         Optional Parameters
         -------------------
         eps_min, eps_max : float
@@ -222,6 +76,7 @@ class ARCHBase:
             the maximum number of iterations for the internal optimization process,
             given to SLSQP.
         """
+        self.f = fobjective
         ww = np.array(weight, copy=True)
         ww[ww < 0] = 0
         ww /= np.sum(np.abs(ww))
@@ -236,7 +91,7 @@ class ARCHBase:
         self.eps = self.eps_min
         self.num_of_fail = 0
         self.maxiter = maxiter
-        
+
         self.tol_for_eqcons = tol_for_eqcons
         self.tol_for_ineqcons = tol_for_ineqcons
         self.num_of_ineq = num_of_ineqcons
@@ -245,21 +100,47 @@ class ARCHBase:
         self.alpha = 1.0
         self.d_alpha = 1.0 / self.N
         self.dm_threshold = 1.0
-        
+
         self._xmean = None
         self._sqrtC = None
         self._sqrtCinv = None
 
+    def do(self, solution_list):
+        """Do all the job"""
+        for sol in solution_list:
+            sol._x_repaired = self.repair(sol._x)
+            self.evaluate(sol)
+        return self.total_ranking(solution_list)
+
+    def evaluate(self, solution):
+        """Evaluate objective and violations
+
+        Parameter
+        ---------
+        solution : object
+            solution._x (input) : original solution
+            solution._x_repaired (input) : repaired solution
+            solution._violation (output) : list of constraint violations
+            solution._penalty (output) : penalty for violation
+        """
+        solution._violation = self.compute_violation(solution._x)
+        solution._penalty   = self.compute_penalty(solution._x, solution._x_repaired)
+
+        if np.all(self.compute_violation(solution._x_repaired) <= 0):
+            solution._f = self.f(solution)
+        else:
+            solution._f = np.inf
+
     def compute_violation(self, x):
         """Compute the violation
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
-        
+
         Returns
         -------
-        violation (float) : g(x) - tol_for_ineqcons for inequality constraints, 
+        violation (float) : g(x) - tol_for_ineqcons for inequality constraints,
                             abs(g(x)) - tol_for_eqcons for equality constraints
         """
         if np.ndim(x) == 1:
@@ -268,10 +149,10 @@ class ARCHBase:
             return np.empty((x.shape[0], 0))
         else:
             raise ValueError
-    
+
     def prepare(self, xmean, xcov):
-        """Preparation 
- 
+        """Preparation
+
         Parameters
         ----------
         xmean : 1d array-like
@@ -285,7 +166,7 @@ class ARCHBase:
         self._sqrtC = np.dot(B * np.sqrt(D), B.T)
         self._sqrtCinv = np.dot(B / np.sqrt(D), B.T)
         self._update_alpha()
-    
+
     def _update_alpha(self):
         """Update alpha (Section 4.3)"""
         if np.all(self.compute_violation(self._xmean) <= 0):
@@ -297,8 +178,8 @@ class ARCHBase:
             self.dm = self.compute_penalty(self._xmean, mfeas)
             self.dm *= self.sqreSNF  # sqreSNF = (optimal normalized step-size / n)^2
             self.dm *= 2. * N / (N + 2. * num_of_act)
-            self.dm *= np.exp(self.lam_def / self.lam - 1.0)  # not included in GECCO ver.
-        
+            self.dm *= np.exp(self.lam_def / self.lam - 1.0)
+
         if not hasattr(self, 'dm_old'):
             self.dm_old = 0.0  # Initialization
         if np.sign(self.dm - self.dm_old) == np.sign(self.dm - self.dm_threshold) or self.dm == 0.0:
@@ -313,15 +194,15 @@ class ARCHBase:
             self.eps *= 10.
         self.eps = np.clip(self.eps, self.eps_min, self.eps_max)
         self.num_of_fail = 0
-    
+
     def repair(self, x, info=False, is_xmean=False):
         """Repair infeasible solutions and return feasible solutions (Section 4.1)
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
             solutions or list of solutions to be repaired
-        
+
         Returns
         -------
         X (same shape as x) : repaired solutions
@@ -346,10 +227,10 @@ class ARCHBase:
             dz = np.dot(dx, self._sqrtCinv)
             pen = np.sum(dz * dz, axis=-1)
             return pen
-    
-    def total_ranking(self, f_list, penalty_list):
-        ff = np.asarray(f_list)
-        pp = np.asarray(penalty_list)
+
+    def total_ranking(self, solution_list):
+        ff = np.asarray([sol._f for sol in solution_list])
+        pp = np.asarray([sol._penalty for sol in solution_list])
         n_better_f = np.asarray([np.sum(ff < f) for f in ff])
         n_equal_f = np.asarray([np.sum(ff == f) for f in ff])
         n_better_p = np.asarray([np.sum(pp < p) for p in pp])
@@ -358,14 +239,14 @@ class ARCHBase:
         rpp = n_better_p + (n_equal_p - 1) / 2.0
         return rff + self.alpha * rpp
         # return rff + rpp
- 
+
 
 class ARCHLinear(ARCHBase):
     """Adaptive Ranking Based Constraint Handling for Explicit Constraints
-    
-    It is an implementation of Quantifiable/Unrelaxable/Apriori/Known 
-    linear equality and inequality constraints. 
-    
+
+    It is an implementation of Quantifiable/Unrelaxable/Apriori/Known
+    linear equality and inequality constraints.
+
     Main Functionarity
     ------------------
     * compute_violation : compute violation values
@@ -375,45 +256,62 @@ class ARCHLinear(ARCHBase):
     ** _nearest_feasible : find the nearest feasible solution in terms of MD
     * compute_penalty : compute the mahalanobis distance betwen original and repaired solutions
     * total_ranking : compute total ranking
-    
+
     Reference
     ---------
-    N. Sakamoto and Y. Akimoto: Adaptive Ranking Based Constraint Handling 
-    for Explicitly Constrained Black-Box Optimization, GECCO 2019. 
+    N. Sakamoto and Y. Akimoto: Adaptive Ranking Based Constraint Handling
+    for Explicitly Constrained Black-Box Optimization, GECCO 2019.
     https://doi.org/10.1145/3321707.3321717
-    
-    """
-    def __init__(self, matA, vecb, matAeq, vecbeq, weight, **kwargs):
-        """Linear constraint handler for A * x <= b
 
+    """
+    def __init__(self, fobjective, matA, vecb, weight,
+                 bound=None, matAeq=None, vecbeq=None, **kwargs):
+        """Linear constraint handler for A * x <= b
         Parameters
         ----------
         matA : 2d array-like
         vecb : 1d array-like
             A and b in A * x <= b
+        weight : 1d array-like
+            recombination weights for CMA-ES
+        bound : tuple (lb, ub)
+            lb[i] <= x[i] <= ub[i]
         matAeq : 2d array-like
         vecbeq : 1d array-like
             A and b in A * x == b
-        weight : 1d array-like
-            recombination weights for CMA-ES 
         kwargs : dict
             optional parameters for ARCHBase
         """
-        super(ARCHLinear, self).__init__(len(matA[0]), weight, len(vecbeq), len(vecb), **kwargs)
-        Ai = np.asarray(matA, dtype=float).reshape(-1, self.N)
-        Ae = np.asarray(matAeq, dtype=float).reshape(-1, self.N)
+        N = len(matA[0])
+
+        # inequality constraints
+        Ai = np.asarray(matA, dtype=float).reshape(-1, N)
         bi = np.asarray(vecb, dtype=float).ravel()
+        if bound is not None:
+            Ab, bb = self.box2lin(bound[0], bound[1])
+            Ai = np.vstack((Ai, Ab))
+            bi = np.hstack((bi, bb))
+
+        # equality constraints
+        if matAeq is None:
+            matAeq = np.empty((0, N))
+            vecbeq = np.empty(0)
+        Ae = np.asarray(matAeq, dtype=float).reshape(-1, N)
         be = np.asarray(vecbeq, dtype=float).ravel()
+
+        super(ARCHLinear, self).__init__(fobjective, N, weight, len(be), len(bi), **kwargs)
         self.A = np.vstack((Ai, Ae, -Ae))
-        self.b = np.hstack((bi + self.tol_for_ineqcons, be + self.tol_for_eqcons, -be + self.tol_for_eqcons))
+        self.b = np.hstack((bi + self.tol_for_ineqcons,
+                            be + self.tol_for_eqcons,
+                            -be + self.tol_for_eqcons))
 
     def compute_violation(self, x):
         """Compute the violation
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
-        
+
         Returns
         -------
         violation (float) : A * x - b - tolerance for inequality constraints,
@@ -426,20 +324,20 @@ class ARCHLinear(ARCHBase):
         ve2 = np.dot(x, self.A[ie:].T) - self.b[ie:]
         v = np.hstack((vi, np.fmax(ve1, ve2)))
         return v
-            
+
     def repair(self, x, info=False, is_xmean=False):
         """Repair infeasible solutions and return feasible solutions (Section 4.1)
-        
+
         Note that Eq (5) always finds a solution as long as constraints are redundant.
         Henc Eq (6) is not implemented.
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
             solutions or list of solutions to be repaired
         info : bool, optional
         is_xmean : bool, optional
-        
+
         Returns
         -------
         X (same shape as x) : repaired solutions
@@ -463,19 +361,16 @@ class ARCHLinear(ARCHBase):
                 raise ValueError
         else:
             return self.repair(x, info=True, is_xmean=is_xmean)[0]
-        
+
     def _nearest_feasible(self, x):
         """Find the nearest feasible solution in terms of the Euclidean distance
-
         Parameters
         ----------
         x : ndarray (1D)
-
         Returns
         -------
         xnear : ndarray
             Repaired x. If `out` is passed, its reference is returned.
-
         J_done : list
             list of index of active inequality constraints
         """
@@ -505,16 +400,33 @@ class ARCHLinear(ARCHBase):
 
 class ARCHNonLinear(ARCHBase):
     """ARCH for Nonlinear Explicit Constraints (ECJ submitted version)"""
-    
-    def __init__(self, dim, weight, ineq_list, eq_list, **kwargs):
-        super(ARCHNonLinear, self).__init__(dim, weight, len(eq_list), len(ineq_list), **kwargs)
+
+    def __init__(self, fobjective, dim, weight, ineq_list, eq_list,
+                 matA=None, vecb=None, matAeq=None, vecbeq=None, bound=None, **kwargs):
+
+        # inequality constraints
+        if (matA is not None) and (vecb is not None):
+            Ai = np.asarray(matA, dtype=float).reshape(-1, N)
+            bi = np.asarray(vecb, dtype=float).ravel()
+            ineq_list += self.lin2nonlin(Ai, bi)
+        if bound is not None:
+            Ab, bb = self.box2lin(bound[0], bound[1])
+            ineq_list += self.lin2nonlin(Ab, bb)
+
+        # equality constraints
+        if (matAeq is not None) and (vecbeq is not None):
+            Ae = np.asarray(matAeq, dtype=float).reshape(-1, N)
+            be = np.asarray(vecbeq, dtype=float).ravel()
+            eq_list += self.lin2nonlin(Ae, be)
+
+        super(ARCHNonLinear, self).__init__(fobjective, dim, weight, len(eq_list), len(ineq_list), **kwargs)
         def gi(g):
             return lambda x: g(x) + self.eps - self.tol_for_ineqcons
         def slsqp_gi(gi):
             return lambda y: -gi(y + self._xmean)
         def slsqp_grad_gi(grad_g):
             return lambda y: -grad_g(y + self._xmean) if grad_g is not None else None
-        
+
         # Inequality constraint list
         self.ineq_list = [(gi(g[0]), g[1]) for g in ineq_list]
         self.slsqp_ineq_func_list = [slsqp_gi(g[0]) for g in self.ineq_list]
@@ -527,14 +439,14 @@ class ARCHNonLinear(ARCHBase):
 
     def compute_violation(self, x):
         """Compute the violation
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
-        
+
         Returns
         -------
-        violation (float) : g(x) - tol_for_ineqcons for inequality constraints, 
+        violation (float) : g(x) - tol_for_ineqcons for inequality constraints,
                             abs(g(x)) - tol_for_eqcons for equality constraints
         """
         if np.ndim(x) == 1:
@@ -547,21 +459,21 @@ class ARCHNonLinear(ARCHBase):
             raise ValueError
 
 
-    def repair(self, x, info=False, is_xmean=False):    
+    def repair(self, x, info=False, is_xmean=False):
         """Repair infeasible solutions and return feasible solutions (Section 4.1)
-        
+
         Parameters
         ----------
         x : 1d or 2d array-like
             solutions or list of solutions to be repaired
         info : bool, optional
         is_xmean : bool, optional
-        
+
         Returns
         -------
         X (same shape as x) : repaired solutions
         J_done (list of int) : list of index of active inequality constraints
-        """    
+        """
         if info:
             violation = self.compute_violation(x)
             if np.all(violation <= 0):
@@ -624,11 +536,11 @@ class ARCHNonLinear(ARCHBase):
 
                 if not is_xmean:
                     self.num_of_fail += 1
-                    
+
                 del f, derivative
                 gc.collect()
                 return self._xmean + ynear, J_ineq
-            
+
         else:
             return self.repair(x, info=True)[0]
 
@@ -652,8 +564,8 @@ class ARCHNonLinear(ARCHBase):
         if len_w <= 0:
             return y
         else:
-            cons = tuple({'type': 'eq', 
-                          'fun': self.slsqp_eq_func_list[j], 
+            cons = tuple({'type': 'eq',
+                          'fun': self.slsqp_eq_func_list[j],
                           'jac': self.slsqp_eq_grad_list[j]}
                          for j in range(self.num_of_eq))
             cons += tuple({'type': 'eq',
@@ -666,21 +578,21 @@ class ARCHNonLinear(ARCHBase):
                           for j in J_ineq)
 
             try:
-                ynear = optimize.minimize(fun=f, 
-                                          x0=y, 
-                                          jac=derivative, 
+                ynear = optimize.minimize(fun=f,
+                                          x0=y,
+                                          jac=derivative,
                                           constraints=cons,
                                           bounds=None,
-                                          method="SLSQP", 
+                                          method="SLSQP",
                                           options={'maxiter': self.maxiter}).x
                 assert np.all(np.isfinite(ynear))
             except:
-                ynear = optimize.minimize(fun=f, 
-                                          x0=y, 
-                                          jac=derivative, 
+                ynear = optimize.minimize(fun=f,
+                                          x0=y,
+                                          jac=derivative,
                                           constraints=cons,
                                           bounds=None,
-                                          method="SLSQP", 
+                                          method="SLSQP",
                                           options={'maxiter': self.maxiter//20}).x
 
             del cons
@@ -690,7 +602,6 @@ class ARCHNonLinear(ARCHBase):
 
 class NormalOrderStatistics(object):
     """Compute Moments of Normal Order Statistics
-
     Requires
     --------
     numpy
@@ -699,13 +610,11 @@ class NormalOrderStatistics(object):
 
     def __init__(self, n):
         """Normal Order Statistics from `n` populations
-
-        Normal order statistics of population size `n` are the ordered 
+        Normal order statistics of population size `n` are the ordered
         random variables
             N_{1:n} < N_{2:n} < ... < N_{n:n}
         that are drawn from the standard normal distribution N(0, 1)
         independently.
-
         Parameters
         ----------
         n : int
@@ -721,11 +630,9 @@ class NormalOrderStatistics(object):
 
     def exp(self):
         """Expectation of the normal order statistics, using Taylor Expansion.
-
         Returns
         -------
         1D ndarray : array of expectation of the normal order statistics
-
         Algorithm
         ---------
         Eq. (4.6.3)--(4.6.5) combined with Example 4.6 in "Order Statistics".
@@ -740,11 +647,9 @@ class NormalOrderStatistics(object):
 
     def var(self):
         """Variance of the normal order statistics, using Taylor Expansion.
-
         Returns
         -------
         1D ndarray : array of variance of the normal order statistics
-
         Algorithm
         ---------
         Eq. (4.6.3)--(4.6.5) combined with Example 4.6 in "Order Statistics".
@@ -758,11 +663,9 @@ class NormalOrderStatistics(object):
 
     def cov(self):
         """Covariance of the normal order statistics, using Taylor Expansion.
-
         Returns
         -------
         2D ndarray : array of covariance of the normal order statistics
-
         Algorithm
         ---------
         Eq. (4.6.3)--(4.6.5) combined with Example 4.6 in "Order Statistics".
@@ -784,7 +687,6 @@ class NormalOrderStatistics(object):
 
     def blom(self):
         """Blom's Approximation of the Expectation of Normal Order Statistics
-
         Returns
         -------
         1D ndarray : array of expectation of the normal order statistics
@@ -795,11 +697,9 @@ class NormalOrderStatistics(object):
 
     def davis_stephens(self):
         """Refinement of Covariance Matrix by Algorithm 128
-
         Returns
         -------
         2D ndarray : array of covariance of the normal order statistics
-
         See
         ---
         https://statistics.stanford.edu/sites/default/files/SOL%20ONR%20254.pdf
@@ -833,9 +733,9 @@ def sigma_normalization_factor(dim, weights, cm=1.):
 def quadratic_optimal_sigma(hess, xmean, weights, cm=1.):
     """Optimal Sigma for Quadratic
     If hess is proportional to [1, ..., 1] or the identity matrix,
-    the result should be the same as 
+    the result should be the same as
     sigma_normalization_factor * ||xmean||.
-    """    
+    """
     nos = NormalOrderStatistics(len(weights))
     nlam = nos.blom()
     beta = -np.dot(nlam, weights)
@@ -876,27 +776,25 @@ def quadratic_optimal_normalized_sigma(hess, weights, cm=1.):
     optns = quadratic_optimal_sigma(hess, xmean, weights, cm=cm) * (cm / g)
     optnqg = beta * optns / 2.0
     return optns, optnqg, g
-        
-        
+
+
 if __name__ == '__main__':
-    try:
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from ddcma import DdCma, Checker, Logger
-    except:
-        raise ImportError("https://gist.github.com/youheiakimoto/1180b67b5a0b1265c204cba991fa8518.js")
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from cmaes import CMAES, Checker, Logger
+
 
     N = 20
-    CASE = 1
+    CASE = 2
 
     class Solution:
         def __init__(self, x):
             self._x = x
             self._x_repaired = None
             self._f = None
-            self._quak_penalty = None
-            self._quak_violation = []
-            
+            self._penalty = None
+            self._violation = []
+
     def f(solution):
         return np.dot(solution._x_repaired, solution._x_repaired)
 
@@ -907,49 +805,45 @@ if __name__ == '__main__':
 
     # --------------------------------------------------------------------- #
     if CASE == 1:
-        print("Case 1: QUAK(1 linear ineq + bound)")
-        ddcma = DdCma(xmean0=(lbound + ubound)/2.,
-                      sigma0=(ubound - lbound)/4., 
-                      flg_variance_update=True, 
-                      flg_covariance_update=True,
-                      flg_active_update=True)
+        print("Case 1: (1 linear ineq + bound)")
+        cma = CMAES(xmean0=(lbound + ubound)/2.,
+                    sigma0=(ubound - lbound)/4.)
 
-        ch = ARCH(dim=ddcma.N, 
-                  weight=ddcma.w, 
-                  fobjective=f, 
-                  bound=(lbound, ubound),
-                  linear_ineq_quak=(A, b)
-        )
-        checker = Checker(ddcma)
-        logger = Logger(ddcma, variable_list=['xmean', 'D', 'S', 'sigma', 'beta'])
+        ch = ARCHLinear(fobjective=f,
+                        matA=A,
+                        vecb=b,
+                        weight=cma.w,
+                        bound=(lbound, ubound))
+        checker = Checker(cma)
+        logger = Logger(cma, variable_list=['xmean', 'D', 'sigma'])
 
         issatisfied = False
         fbestsofar = np.inf
         while not issatisfied:
-            xx, yy, zz = ddcma.sample()
+            xx = cma.sample_candidate()
             sol_list = [Solution(x) for x in xx]
-            xcov = ddcma.transform(ddcma.transform(np.eye(N)).T)
-            ch.prepare(ddcma.xmean, xcov)
+            xcov = cma.transform(cma.transform(np.eye(N)).T)
+            ch.prepare(cma.xmean, xcov)
             ranking = ch.do(sol_list)
             idx = np.argsort(ranking)
-            ddcma.update(idx, xx, yy, zz)
-            
-            ddcma.t += 1        
-            ddcma.neval += ddcma.lam        
-            ddcma.arf = np.array([sol._f for sol in sol_list])
-            ddcma.arx = np.array([sol._x for sol in sol_list])
-            fbest = np.min(ddcma.arf)      
+            cma.update(idx, xx)
+
+            cma.niter += 1
+            cma.neval += cma.lam
+            cma.arf = np.array([sol._f for sol in sol_list])
+            cma.arx = np.array([sol._x for sol in sol_list])
+            fbest = np.min(cma.arf)
             fbestsofar = min(fbest, fbestsofar)
             if fbest < -np.inf:
                 issatisfied, condition = True, 'ftarget'
-            elif ddcma.t > 1000:
+            elif cma.niter > 1000:
                 issatisfied, condition = True, 'maxiter'
             else:
                 issatisfied, condition = checker()
-            if ddcma.t % 10 == 0:
-                print(ddcma.t, ddcma.neval, fbest, fbestsofar)
+            if cma.niter % 10 == 0:
+                print(cma.niter, cma.neval, fbest, fbestsofar)
                 logger()
-        print(ddcma.t, ddcma.neval, fbest, fbestsofar)
+        print(cma.niter, cma.neval, fbest, fbestsofar)
         print("Terminated with condition: " + condition)
         logger(condition)
 
@@ -962,49 +856,46 @@ if __name__ == '__main__':
 
     # --------------------------------------------------------------------- #
     elif CASE == 2:
-        print("Case 2: QUAK(1 nonlinear ineq + bound)")
-        ddcma = DdCma(xmean0=(lbound + ubound)/2.,
-                      sigma0=(ubound - lbound)/4., 
-                      flg_variance_update=True, 
-                      flg_covariance_update=True,
-                      flg_active_update=True)
-
-        ch = ARCH(dim=ddcma.N, 
-                  weight=ddcma.w, 
-                  fobjective=f, 
-                  bound=(lbound, ubound),
-                  nonlinear_ineq_quak_list=ARCH.lin2nonlin(A, b)
-        )
-        checker = Checker(ddcma)
-        logger = Logger(ddcma, variable_list=['xmean', 'D', 'S', 'sigma', 'beta'])
+        print("Case 2: (1 nonlinear ineq + bound)")
+        cma = CMAES(xmean0=(lbound + ubound)/2.,
+                    sigma0=(ubound - lbound)/4.)
+        ch = ARCHNonLinear(fobjective=f,
+                           dim=cma.N,
+                           weight=cma.w,
+                           bound=(lbound, ubound),
+                           ineq_list=ARCHNonLinear.lin2nonlin(A, b),
+                           eq_list=[]
+                           )
+        checker = Checker(cma)
+        logger = Logger(cma, variable_list=['xmean', 'D', 'sigma'])
 
         issatisfied = False
         fbestsofar = np.inf
         while not issatisfied:
-            xx, yy, zz = ddcma.sample()
+            xx = cma.sample_candidate()
             sol_list = [Solution(x) for x in xx]
-            xcov = ddcma.transform(ddcma.transform(np.eye(N)).T)
-            ch.prepare(ddcma.xmean, xcov)
+            xcov = cma.transform(cma.transform(np.eye(N)).T)
+            ch.prepare(cma.xmean, xcov)
             ranking = ch.do(sol_list)
             idx = np.argsort(ranking)
-            ddcma.update(idx, xx, yy, zz)
-            
-            ddcma.t += 1        
-            ddcma.neval += ddcma.lam        
-            ddcma.arf = np.array([sol._f for sol in sol_list])
-            ddcma.arx = np.array([sol._x for sol in sol_list])
-            fbest = np.min(ddcma.arf)      
+            cma.update(idx, xx)
+
+            cma.niter += 1
+            cma.neval += cma.lam
+            cma.arf = np.array([sol._f for sol in sol_list])
+            cma.arx = np.array([sol._x for sol in sol_list])
+            fbest = np.min(cma.arf)
             fbestsofar = min(fbest, fbestsofar)
             if fbest < -np.inf:
                 issatisfied, condition = True, 'ftarget'
-            elif ddcma.t > 1000:
+            elif cma.niter > 1000:
                 issatisfied, condition = True, 'maxiter'
             else:
                 issatisfied, condition = checker()
-            if ddcma.t % 10 == 0:
-                print(ddcma.t, ddcma.neval, fbest, fbestsofar)
+            if cma.niter % 10 == 0:
+                print(cma.niter, cma.neval, fbest, fbestsofar)
                 logger()
-        print(ddcma.t, ddcma.neval, fbest, fbestsofar)
+        print(cma.niter, cma.neval, fbest, fbestsofar)
         print("Terminated with condition: " + condition)
         logger(condition)
 
